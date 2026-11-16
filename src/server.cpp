@@ -609,6 +609,13 @@ struct Server::Impl {
     if (response.status < 100 || response.status > 599) {
       response = Response(500, "invalid response status\n", "text/plain; charset=utf-8");
     }
+    bool invalid_trailer = false;
+    for (const auto& [name, value] : response.trailers.entries()) {
+      if (!detail::is_token(name) || !detail::is_valid_header_value(value)) invalid_trailer = true;
+    }
+    if (invalid_trailer) {
+      response = Response(500, "invalid response trailer\n", "text/plain; charset=utf-8");
+    }
     for (const auto& [name, value] : response.headers.entries()) {
       if (!detail::is_token(name) || !detail::is_valid_header_value(value)) {
         response = Response(500, "invalid response header\n", "text/plain; charset=utf-8");
@@ -655,11 +662,13 @@ struct Server::Impl {
       }
     }
 
+    const bool send_trailers =
+        !response.trailers.empty() && http11 && !head_request && !status_has_no_body;
     std::uint64_t body_size = response.body.size();
-    bool chunked = false;
+    bool chunked = send_trailers;
     if (!status_has_no_body) {
       if (response.body.kind() == Body::Kind::Stream) {
-        if (!head_request && http11 && keep_alive) {
+        if (!head_request && http11 && (keep_alive || send_trailers)) {
           chunked = true;
         } else if (!head_request) {
           keep_alive = false;
@@ -668,6 +677,17 @@ struct Server::Impl {
         body_size = file_length;
       } else if (body_size == Body::unknown_size) {
         body_size = 0;
+      }
+    }
+
+    if (chunked) {
+      if (!response.headers.has("trailer") && !response.trailers.empty()) {
+        std::string names;
+        for (const auto& [name, value] : response.trailers.entries()) {
+          if (!names.empty()) names += ", ";
+          names += name;
+        }
+        response.headers.set("trailer", names);
       }
     }
 
@@ -708,7 +728,7 @@ struct Server::Impl {
     }
     head += "\r\n";
 
-    const bool combine_body = !head_request && !status_has_no_body &&
+    const bool combine_body = !head_request && !status_has_no_body && !chunked &&
                               (response.body.kind() == Body::Kind::Owned ||
                                response.body.kind() == Body::Kind::Borrowed) &&
                               response.body.view().size() <= 64 * 1024;
@@ -726,8 +746,19 @@ struct Server::Impl {
         case Body::Kind::Owned:
         case Body::Kind::Borrowed: {
           if (combine_body) break;
-          auto result = co_await write_all(stream, response.body.view(), deadline);
-          if (!result.ok()) co_return false;
+          if (chunked && !response.body.view().empty()) {
+            char size_buffer[32];
+            std::snprintf(size_buffer, sizeof size_buffer, "%zx\r\n",
+                          response.body.view().size());
+            std::string frame = size_buffer;
+            frame += response.body.view();
+            frame += "\r\n";
+            auto result = co_await write_all(stream, frame, deadline);
+            if (!result.ok()) co_return false;
+          } else {
+            auto result = co_await write_all(stream, response.body.view(), deadline);
+            if (!result.ok()) co_return false;
+          }
           break;
         }
         case Body::Kind::File: {
@@ -755,12 +786,27 @@ struct Server::Impl {
               ok = false;
               break;
             }
-            auto result = co_await write_all(stream, as_bytes(std::span<const char>(
-                                                         buffer.data(), static_cast<std::size_t>(n))),
-                                             deadline);
-            if (!result.ok()) {
-              ok = false;
-              break;
+            if (chunked) {
+              char size_buffer[32];
+              std::snprintf(size_buffer, sizeof size_buffer, "%zx\r\n",
+                            static_cast<std::size_t>(n));
+              std::string frame = size_buffer;
+              frame.append(buffer.data(), static_cast<std::size_t>(n));
+              frame += "\r\n";
+              auto result = co_await write_all(stream, frame, deadline);
+              if (!result.ok()) {
+                ok = false;
+                break;
+              }
+            } else {
+              auto result = co_await write_all(
+                  stream,
+                  as_bytes(std::span<const char>(buffer.data(), static_cast<std::size_t>(n))),
+                  deadline);
+              if (!result.ok()) {
+                ok = false;
+                break;
+              }
             }
             offset += static_cast<std::uint64_t>(n);
             remaining -= static_cast<std::uint64_t>(n);
@@ -791,12 +837,21 @@ struct Server::Impl {
             }
             chunk.clear();
           }
-          if (chunked) {
-            auto result = co_await write_all(stream, "0\r\n\r\n", deadline);
-            if (!result.ok()) co_return false;
-          }
           break;
         }
+      }
+
+      if (chunked) {
+        std::string ending = "0\r\n";
+        for (const auto& [name, value] : response.trailers.entries()) {
+          ending += name;
+          ending += ": ";
+          ending += value;
+          ending += "\r\n";
+        }
+        ending += "\r\n";
+        auto result = co_await write_all(stream, ending, deadline);
+        if (!result.ok()) co_return false;
       }
     } catch (const std::exception& e) {
       log_warning(std::string("response body failed: ") + e.what());

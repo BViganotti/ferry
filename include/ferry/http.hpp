@@ -132,6 +132,7 @@ struct Request {
   std::string tls_version;
   bool chunked = false;
   std::uint64_t content_length = 0;
+  Headers trailers;
   std::vector<std::pair<std::string, std::string>> route_params;
 
   std::string_view header(std::string_view name) const noexcept { return headers.get(name); }
@@ -171,6 +172,7 @@ struct Response {
   std::string reason;
   Headers headers;
   Body body;
+  Headers trailers;
   bool close_connection = false;
 
   // Client transport failures set status = 0 and fill this.

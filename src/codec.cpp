@@ -240,7 +240,7 @@ class ChunkedDecoder {
   enum class Result { NeedMore, Done, Bad, TooLarge };
 
   Result feed(std::string_view data, std::string& out, std::size_t max_body,
-              const Limits& limits, std::size_t& consumed) {
+              const Limits& limits, Headers* trailers, std::size_t& consumed) {
     std::size_t index = 0;
     for (;;) {
       switch (state_) {
@@ -323,14 +323,26 @@ class ChunkedDecoder {
               line_.pop_back();
               bool empty_line = line_.empty();
               trailer_bytes_ += line_.size() + 2;
-              line_.clear();
               if (trailer_bytes_ > limits.max_trailer_bytes) return fail(Result::Bad);
               if (empty_line) {
+                line_.clear();
                 state_ = State::Done;
                 consumed = index;
                 return Result::Done;
               }
-              if (line_.size() > limits.max_chunk_line) return fail(Result::Bad);
+              auto colon = line_.find(':');
+              if (colon == std::string::npos || colon == 0) return fail(Result::Bad);
+              auto name = std::string_view(line_).substr(0, colon);
+              auto value = trim_ows(std::string_view(line_).substr(colon + 1));
+              if (!is_token(name) || !is_valid_header_value(value)) return fail(Result::Bad);
+              if (trailers) {
+                try {
+                  trailers->add(std::string(name), std::string(value));
+                } catch (const std::exception&) {
+                  return fail(Result::Bad);
+                }
+              }
+              line_.clear();
             } else {
               line_.push_back(c);
               if (line_.size() > limits.max_chunk_line) return fail(Result::Bad);
@@ -639,7 +651,8 @@ task<BodyResult> read_request_body(Stream& stream, std::string& buffer, std::siz
     ChunkedDecoder decoder;
     for (;;) {
       std::size_t consumed = 0;
-      auto chunk = decoder.feed(buffer, request.body, limits.max_body_bytes, limits, consumed);
+      auto chunk = decoder.feed(buffer, request.body, limits.max_body_bytes, limits,
+                                &request.trailers, consumed);
       buffer.erase(0, consumed);
       if (chunk == ChunkedDecoder::Result::Done) co_return result;
       if (chunk == ChunkedDecoder::Result::Bad) {
@@ -718,7 +731,8 @@ task<BodyResult> read_response_body(Stream& stream, std::string& buffer, std::si
     ChunkedDecoder decoder;
     for (;;) {
       std::size_t consumed = 0;
-      auto chunk = decoder.feed(buffer, body, limits.max_body_bytes, limits, consumed);
+      auto chunk = decoder.feed(buffer, body, limits.max_body_bytes, limits, &response.trailers,
+                                consumed);
       buffer.erase(0, consumed);
       if (chunk == ChunkedDecoder::Result::Done) {
         response.body = Body(std::move(body));

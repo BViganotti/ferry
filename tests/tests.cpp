@@ -462,6 +462,17 @@ TEST(server_core) {
     co_return ferry::Response::text(std::string(request.form("a")) + "|" +
                                     std::string(request.form("b")));
   });
+  server.get("/trailers", [](const ferry::Request&) -> ferry::task<ferry::Response> {
+    ferry::Response response = ferry::Response::text("trailer body");
+    response.trailers.set("x-checksum", "abc123");
+    response.trailers.set("x-note", "done");
+    co_return response;
+  });
+  server.post("/request-trailers",
+              [](const ferry::Request& request) -> ferry::task<ferry::Response> {
+                co_return ferry::Response::text(request.body + "|" +
+                                                std::string(request.trailers.get("x-tag")));
+              });
   server.post("/multipart", [](const ferry::Request& request) -> ferry::task<ferry::Response> {
     const auto& multipart = request.multipart();
     const auto* title = request.part("title");
@@ -555,6 +566,12 @@ TEST(server_core) {
     CHECK_EQ(std::string(after_delete.body.view()), "|");
     client.clear_cookies();
     CHECK_EQ(client.cookies().size(), std::size_t{0});
+
+    auto trailer_response = co_await client.get(base + "/trailers");
+    CHECK_EQ(trailer_response.status, 200);
+    CHECK_EQ(std::string(trailer_response.body.view()), "trailer body");
+    CHECK_EQ(trailer_response.trailers.get("x-checksum"), "abc123");
+    CHECK_EQ(trailer_response.trailers.get("x-note"), "done");
 
     const std::string boundary = "XyZ";
     std::string multipart_body =
@@ -874,6 +891,11 @@ TEST(raw_protocol_security) {
   server.get("/", [](const ferry::Request&) -> ferry::task<ferry::Response> {
     co_return ferry::Response::text("ok");
   });
+  server.post("/request-trailers",
+              [](const ferry::Request& request) -> ferry::task<ferry::Response> {
+                co_return ferry::Response::text(request.body + "|" +
+                                                std::string(request.trailers.get("x-tag")));
+              });
   server.start();
 
   run_async([&]() -> ferry::task<void> {
@@ -924,6 +946,12 @@ TEST(raw_protocol_security) {
         "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
         "Connection: close\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n");
     CHECK(contains(chunked, "hello world"));
+
+    auto trailers = co_await raw_request(
+        server.port(),
+        "POST /request-trailers HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+        "Connection: close\r\n\r\n5\r\nhello\r\n0\r\nx-tag: tail\r\n\r\n");
+    CHECK(contains(trailers, "hello|tail"));
 
     auto bad_chunk = co_await raw_request(
         server.port(),
