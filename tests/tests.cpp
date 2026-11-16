@@ -11,7 +11,11 @@
 #include <thread>
 #include <vector>
 
+#include <poll.h>
+#include <sys/socket.h>
 #include <unistd.h>
+
+#include <netinet/in.h>
 
 #include "codec.hpp"
 #include "compression.hpp"
@@ -68,6 +72,146 @@ std::string lower(std::string text) {
   }
   return text;
 }
+
+class MiniProxy {
+ public:
+  MiniProxy() {
+    listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    ::bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof address);
+    ::listen(listen_fd_, 16);
+    socklen_t length = sizeof address;
+    ::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&address), &length);
+    port_ = ntohs(address.sin_port);
+    thread_ = std::thread([this] { accept_loop(); });
+  }
+
+  ~MiniProxy() {
+    stopping_ = true;
+    if (listen_fd_ >= 0) {
+      ::shutdown(listen_fd_, SHUT_RDWR);
+      ::close(listen_fd_);
+    }
+    if (thread_.joinable()) thread_.join();
+    for (auto& thread : handlers_) {
+      if (thread.joinable()) thread.join();
+    }
+  }
+
+  std::uint16_t port() const { return port_; }
+
+ private:
+  void accept_loop() {
+    while (!stopping_) {
+      int fd = ::accept(listen_fd_, nullptr, nullptr);
+      if (fd < 0) break;
+      handlers_.emplace_back([this, fd] { handle(fd); });
+    }
+  }
+
+  static bool write_all(int fd, const char* data, std::size_t size) {
+    while (size > 0) {
+      ssize_t n = ::send(fd, data, size, 0);
+      if (n <= 0) return false;
+      data += n;
+      size -= static_cast<std::size_t>(n);
+    }
+    return true;
+  }
+
+  void handle(int client) {
+    std::string request;
+    char buffer[4096];
+    while (request.find("\r\n\r\n") == std::string::npos) {
+      ssize_t n = ::recv(client, buffer, sizeof buffer, 0);
+      if (n <= 0) {
+        ::close(client);
+        return;
+      }
+      request.append(buffer, static_cast<std::size_t>(n));
+      if (request.size() > 65536) {
+        ::close(client);
+        return;
+      }
+    }
+
+    auto line_end = request.find("\r\n");
+    auto line = request.substr(0, line_end);
+    if (!line.starts_with("CONNECT ")) {
+      ::close(client);
+      return;
+    }
+    auto authority = line.substr(8, line.find(' ', 8) - 8);
+    auto colon = authority.rfind(':');
+    if (colon == std::string::npos) {
+      ::close(client);
+      return;
+    }
+    std::string host = authority.substr(0, colon);
+    auto port = static_cast<std::uint16_t>(std::atoi(authority.substr(colon + 1).c_str()));
+    auto addresses = ferry::Address::resolve(host, port);
+    if (addresses.empty()) {
+      ::close(client);
+      return;
+    }
+
+    int upstream = -1;
+    for (const auto& address : addresses) {
+      int candidate = ::socket(address.family(), SOCK_STREAM, 0);
+      if (candidate < 0) continue;
+      if (::connect(candidate, reinterpret_cast<const sockaddr*>(&address.storage),
+                    address.length) == 0) {
+        upstream = candidate;
+        break;
+      }
+      ::close(candidate);
+    }
+    if (upstream < 0) {
+      ::close(client);
+      return;
+    }
+
+    const char* established = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    if (!write_all(client, established, std::strlen(established))) {
+      ::close(upstream);
+      ::close(client);
+      return;
+    }
+
+    pollfd fds[2] = {{client, POLLIN, 0}, {upstream, POLLIN, 0}};
+    for (;;) {
+      int ready = ::poll(fds, 2, 5000);
+      if (ready <= 0) break;
+      bool closed = false;
+      for (int i = 0; i < 2; ++i) {
+        if ((fds[i].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+        ssize_t n = ::recv(fds[i].fd, buffer, sizeof buffer, 0);
+        if (n <= 0) {
+          closed = true;
+          break;
+        }
+        if (!write_all(fds[1 - i].fd, buffer, static_cast<std::size_t>(n))) {
+          closed = true;
+          break;
+        }
+      }
+      if (closed) break;
+    }
+    ::close(upstream);
+    ::close(client);
+  }
+
+  int listen_fd_ = -1;
+  std::uint16_t port_ = 0;
+  std::thread thread_;
+  std::vector<std::thread> handlers_;
+  std::atomic<bool> stopping_{false};
+};
 
 struct TempDir {
   std::filesystem::path path;
@@ -508,6 +652,57 @@ TEST(streaming_and_gzip) {
         "GET /big HTTP/1.1\r\nHost: x\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n");
     CHECK(contains(lower(raw), "content-encoding: gzip"));
 #endif
+  });
+  server.stop();
+}
+
+TEST(proxy_forwarding) {
+  ferry::Server proxy(test_config());
+  proxy.any("/{*path}", [](const ferry::Request& request) -> ferry::task<ferry::Response> {
+    co_return ferry::Response::text(std::string(request.target) + "|" +
+                                    std::string(request.header("host")) + "|" +
+                                    std::string(request.header("proxy-authorization")));
+  });
+  proxy.start();
+
+  run_async([&]() -> ferry::task<void> {
+    ferry::ClientConfig config;
+    config.proxy = "http://user:pass@127.0.0.1:" + std::to_string(proxy.port());
+    ferry::Client client(config);
+
+    auto first = co_await client.get("http://example.invalid/thing?q=1");
+    CHECK_EQ(first.status, 200);
+    CHECK_EQ(std::string(first.body.view()),
+             "http://example.invalid/thing?q=1|example.invalid|Basic dXNlcjpwYXNz");
+
+    auto second = co_await client.get("http://other.invalid/");
+    CHECK_EQ(second.status, 200);
+    CHECK_EQ(std::string(second.body.view()),
+             "http://other.invalid/|other.invalid|Basic dXNlcjpwYXNz");
+  });
+  proxy.stop();
+}
+
+TEST(proxy_connect_tls) {
+  auto config = test_config();
+  config.tls = ferry::TlsConfig{std::string(FERRY_TEST_CERT_DIR) + "/localhost.crt",
+                                std::string(FERRY_TEST_CERT_DIR) + "/localhost.key"};
+  ferry::Server server(config);
+  server.get("/", [](const ferry::Request&) -> ferry::task<ferry::Response> {
+    co_return ferry::Response::text("through tunnel");
+  });
+  server.start();
+
+  MiniProxy proxy;
+
+  run_async([&]() -> ferry::task<void> {
+    ferry::ClientConfig client_config;
+    client_config.ca_file = std::string(FERRY_TEST_CERT_DIR) + "/localhost.crt";
+    client_config.proxy = "http://127.0.0.1:" + std::to_string(proxy.port());
+    ferry::Client client(client_config);
+    auto response = co_await client.get("https://localhost:" + std::to_string(server.port()) + "/");
+    CHECK_EQ(response.status, 200);
+    CHECK_EQ(std::string(response.body.view()), "through tunnel");
   });
   server.stop();
 }

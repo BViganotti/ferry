@@ -109,6 +109,9 @@ class PlainStream final : public Stream {
   task<void> shutdown(Deadline deadline) override;
   int fd() const noexcept override { return socket_.fd(); }
 
+  // Detaches the socket, e.g. to upgrade a CONNECT tunnel to TLS.
+  Socket release_socket() noexcept { return std::move(socket_); }
+
  private:
   Socket socket_;
 };

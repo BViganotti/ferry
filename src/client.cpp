@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -94,12 +95,36 @@ struct Client::Impl {
 
   ClientConfig config;
   CookieJar jar;
+  std::optional<Url> proxy_url;
+  std::string proxy_error;
+  std::string proxy_authorization;
   EventLoop* loop = nullptr;
   std::shared_ptr<TlsContext> verified_tls;
   std::shared_ptr<TlsContext> insecure_tls;
   std::unordered_map<std::string, std::vector<IdleConnection>> pool;
 
-  explicit Impl(ClientConfig cfg) : config(std::move(cfg)) {}
+  explicit Impl(ClientConfig cfg) : config(std::move(cfg)) {
+    if (!config.proxy.empty()) {
+      auto parsed = Url::parse(config.proxy);
+      if (!parsed || parsed->scheme != "http" || parsed->host.empty()) {
+        proxy_error = "invalid proxy URL (expected http://[user:pass@]host:port)";
+      } else {
+        proxy_url = std::move(*parsed);
+        if (!proxy_url->userinfo.empty()) {
+          proxy_authorization = "Basic " + base64_encode(percent_decode(proxy_url->userinfo));
+        }
+      }
+    }
+  }
+
+  std::string connection_key(const Url& url) const {
+    if (proxy_url && !url.is_tls()) return "proxy:" + proxy_url->origin();
+    return origin_key(url);
+  }
+
+  bool using_forward_proxy(const Url& url) const {
+    return proxy_url.has_value() && !url.is_tls();
+  }
 
   std::shared_ptr<TlsContext> tls_context(std::string& error) {
     if (config.verify_tls) {
@@ -117,9 +142,50 @@ struct Client::Impl {
     return insecure_tls;
   }
 
+  task<bool> establish_tunnel(Stream& stream, const Url& target, Deadline deadline,
+                              std::string& error) {
+    std::string authority;
+    if (target.host.find(':') != std::string::npos) {
+      authority = "[" + target.host + "]:" + std::to_string(target.effective_port());
+    } else {
+      authority = target.host + ":" + std::to_string(target.effective_port());
+    }
+
+    std::string request = "CONNECT " + authority + " HTTP/1.1\r\nHost: " + authority + "\r\n";
+    if (!proxy_authorization.empty()) {
+      request += "Proxy-Authorization: " + proxy_authorization + "\r\n";
+    }
+    request += "Proxy-Connection: keep-alive\r\n\r\n";
+
+    auto written = co_await write_all(stream, request, deadline);
+    if (!written.ok()) {
+      error = written.message();
+      co_return false;
+    }
+
+    std::string buffer;
+    auto head = co_await detail::read_head(stream, buffer, config.max_header_bytes, deadline);
+    if (head.status != detail::ReadStatus::Ok) {
+      error = "proxy CONNECT failed: " + head.message;
+      co_return false;
+    }
+    auto line_end = buffer.find("\r\n");
+    if (line_end == std::string::npos) {
+      error = "proxy sent a malformed CONNECT response";
+      co_return false;
+    }
+    std::string_view status_line(buffer.data(), line_end);
+    bool success = status_line.starts_with("HTTP/1.1 2") || status_line.starts_with("HTTP/1.0 2");
+    if (!success) {
+      error = "proxy CONNECT rejected: " + std::string(status_line);
+      co_return false;
+    }
+    co_return true;
+  }
+
   task<Acquired> acquire(const Url& url, Deadline deadline, bool allow_reuse, std::string& error) {
     Acquired acquired;
-    auto key = origin_key(url);
+    auto key = connection_key(url);
 
     if (allow_reuse && config.reuse_connections) {
       auto found = pool.find(key);
@@ -146,6 +212,46 @@ struct Client::Impl {
 
     auto connect_deadline = Deadline::earlier(
         deadline, Deadline::after(config.connect_timeout));
+
+    if (!config.proxy.empty() && !proxy_url) {
+      error = proxy_error;
+      co_return acquired;
+    }
+
+    if (proxy_url && url.is_tls()) {
+      // CONNECT to the proxy, then run TLS to the target through the tunnel.
+      auto connected = co_await connect_tcp(proxy_url->host, proxy_url->effective_port(),
+                                            connect_deadline);
+      if (!connected.socket.valid()) {
+        error = connected.error;
+        co_return acquired;
+      }
+      PlainStream tunnel(std::move(connected.socket));
+      if (!co_await establish_tunnel(tunnel, url, deadline, error)) co_return acquired;
+
+      auto context = tls_context(error);
+      if (!context) co_return acquired;
+      auto result = co_await TlsStream::connect(tunnel.release_socket(), url.host, context,
+                                                config.verify_tls, deadline);
+      if (!result.ok()) {
+        error = result.error;
+        co_return acquired;
+      }
+      acquired.stream = std::move(result.stream);
+      co_return acquired;
+    }
+
+    if (proxy_url) {
+      auto connected = co_await connect_tcp(proxy_url->host, proxy_url->effective_port(),
+                                            connect_deadline);
+      if (!connected.socket.valid()) {
+        error = connected.error;
+        co_return acquired;
+      }
+      acquired.stream = std::make_unique<PlainStream>(std::move(connected.socket));
+      co_return acquired;
+    }
+
     auto connected = co_await connect_tcp(url.host, url.effective_port(), connect_deadline);
     if (!connected.socket.valid()) {
       error = connected.error;
@@ -168,10 +274,10 @@ struct Client::Impl {
     co_return acquired;
   }
 
-  void release(std::unique_ptr<Stream> stream, const Url& url) {
+  void release(std::unique_ptr<Stream> stream, const std::string& key) {
     if (!stream) return;
     if (!config.reuse_connections || config.max_idle_per_host == 0) return;
-    auto& idle = pool[origin_key(url)];
+    auto& idle = pool[key];
     idle.push_back(IdleConnection{std::move(stream), std::chrono::steady_clock::now()});
     while (idle.size() > config.max_idle_per_host) {
       idle.erase(idle.begin());
@@ -193,6 +299,11 @@ struct Client::Impl {
       headers.set("accept-encoding", "gzip");
     }
     headers.set("connection", keep_alive ? "keep-alive" : "close");
+
+    if (using_forward_proxy(pending.url) && !proxy_authorization.empty() &&
+        !headers.has("proxy-authorization")) {
+      headers.set("proxy-authorization", proxy_authorization);
+    }
 
     if (config.use_cookies) {
       auto cookie = jar.header_for(pending.url);
@@ -248,7 +359,12 @@ struct Client::Impl {
     head.reserve(256 + headers.size() * 32);
     head += method_name(pending.method);
     head += ' ';
-    head += pending.url.target();
+    if (using_forward_proxy(pending.url)) {
+      head += pending.url.origin();
+      head += pending.url.target();
+    } else {
+      head += pending.url.target();
+    }
     head += " HTTP/1.1\r\n";
     for (const auto& [name, value] : headers.entries()) {
       head += name;
@@ -494,7 +610,7 @@ struct Client::Impl {
 
       bool keep = config.reuse_connections && !close_after && !response.close_connection;
       if (keep) {
-        release(std::move(acquired.stream), pending.url);
+        release(std::move(acquired.stream), connection_key(pending.url));
       } else {
         acquired.stream.reset();
       }

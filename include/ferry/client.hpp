@@ -26,6 +26,10 @@ struct ClientConfig {
   int max_redirects = 5;
   bool verify_tls = true;
   std::string ca_file;
+
+  // Optional forward proxy. Supports http://[user:pass@]host:port.
+  // Plain HTTP requests use absolute-form; HTTPS requests use CONNECT.
+  std::string proxy;
   std::string client_certificate_file;  // optional mTLS client certificate
   std::string client_private_key_file;
 
