@@ -67,6 +67,10 @@ the whole job:
 - TLS 1.2+ with system CA store or a custom CA file, SNI and hostname checks.
 - Connection pooling with idle timeouts, automatic retry of safe requests on a
   stale pooled connection, gzip decoding.
+- Automatic cookie jar (`Set-Cookie` / `Cookie`), multipart form parsing.
+- HTTP forward proxies (absolute-form) and HTTPS via CONNECT tunnelling.
+- Background DNS resolution with deadlines; no blocking getaddrinfo on the
+  event loop.
 - Redirects (301/302/303/307/308) with method rewriting and cross-origin
   `Authorization` stripping.
 - Buffered or streamed request bodies, file uploads, chunked requests.
@@ -153,6 +157,9 @@ request.query("page");
 request.param("id");
 request.cookie("session");
 request.form("email");
+request.multipart();                // parsed parts
+request.part("upload");             // MultipartPart* (filename, content type, body)
+request.trailers;                   // chunked request trailers
 request.body;                       // std::string, buffered
 request.keep_alive();
 ```
@@ -181,6 +188,29 @@ co_return ferry::Response::stream(
       co_return true;
     });
 ```
+
+## WebSocket
+
+```cpp
+server.ws("/ws", [](ferry::WebSocket& socket) -> ferry::task<void> {
+  for (;;) {
+    auto frame = co_await socket.read();
+    if (!frame || frame->opcode == ferry::WsFrame::Opcode::Close) co_return;
+    if (frame->text()) co_await socket.send_text("echo: " + frame->payload);
+  }
+});
+
+// client
+auto socket = co_await ferry::websocket_connect("wss://example.com/ws");
+if (socket) {
+  co_await socket->send_text("hello");
+  auto frame = co_await socket->read();
+}
+```
+
+The client uses `WsClientOptions` for TLS verification and timeouts. Frames
+are unmasked server-to-client and masked client-to-server as required; control
+frames, fragmentation, ping/pong and close are handled.
 
 ## Client API
 
@@ -271,6 +301,8 @@ against the certificate's IP SAN; DNS names use SNI and hostname verification.
 | `follow_redirects`, `max_redirects` | on, 5 |
 | `verify_tls` | on |
 | `client_certificate_file` / `client_private_key_file` | empty (no mTLS) |
+| `proxy` | empty (direct) |
+| `use_cookies` | on |
 | `reuse_connections` | on |
 | `max_idle_per_host` | 8 |
 
@@ -330,14 +362,12 @@ Deliberately not implemented yet:
 
 - HTTP/2 (HPACK, framing, flow control) and HTTP/3.
 - WebSocket upgrades.
-- Client-side cookie jar and automatic `Authorization` refresh.
-- HTTP proxy and CONNECT support.
-- Multipart form parsing.
-- Asynchronous DNS (`getaddrinfo` is blocking during connect).
+- HTTP/2 (HPACK, framing, flow control) and HTTP/3.
 - Streaming *request* bodies to a handler (requests are buffered up to
   `max_body_bytes`; responses can stream).
-- Multi-range requests and `If-Range`, and `If-Modified-Since` (ETag works).
 - Compression of streamed/file bodies (owned in-memory bodies are compressed).
+- WebSocket support through an HTTP proxy.
+- Automatic `Authorization` refresh and public-suffix cookie enforcement.
 - HTTP/2 prior knowledge, trailers API, and server push.
 
 Already there: HTTP/1.1 keep-alive and pipelining, chunked request/response
@@ -355,6 +385,9 @@ redirects, pooling, range requests, static files, and graceful shutdown.
 | `include/ferry/http.hpp` | headers, bodies, requests, responses |
 | `include/ferry/server.hpp` | server API and configuration |
 | `include/ferry/client.hpp` | client API and configuration |
+| `include/ferry/cookie_jar.hpp` | client cookie storage |
+| `include/ferry/multipart.hpp` | multipart form-data parser |
+| `include/ferry/websocket.hpp` | WebSocket client/server |
 | `src/*.cpp` | implementation |
 | `tests/tests.cpp` | unit, protocol, TLS, concurrency tests |
 | `examples/` | hello, HTTPS and client examples |

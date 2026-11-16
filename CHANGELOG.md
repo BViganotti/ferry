@@ -16,10 +16,16 @@ First complete cut.
   verification on by default; optional client certificates and mTLS.
 - Client: keep-alive pool, redirects, gzip, chunked, file/stream uploads,
   cross-origin authorization stripping, safe-method retry.
+- Client cookie jar, multipart form-data parsing, forward proxy + CONNECT,
+  background DNS resolver with deadlines.
+- WebSocket server routes and client handshake, fragmentation, ping/pong,
+  close, masked frames.
+- Request/response trailers, static `If-Modified-Since`, `If-Range`, and
+  multipart byte ranges.
 - Hardened parsing: bounded headers/body/chunks/trailers, smuggling rejection,
   header injection prevention, strict line endings.
 - Graceful shutdown, connection limits, timeouts, access log hook.
-- Tests: 15 suites covering codec, routing, plain/TLS/mTLS client-server
+- Tests: 19 suites covering codec, routing, plain/TLS/mTLS client-server
   flows, static files, raw protocol attacks, timeouts and concurrency.
 - ASan/UBSan and TSan clean; benchmark tool plus wrk comparison against Go
   `net/http`.
