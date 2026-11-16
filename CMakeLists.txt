@@ -20,6 +20,7 @@ find_package(OpenSSL REQUIRED)
 set(FERRY_SOURCES
   src/event_loop.cpp
   src/net.cpp
+  src/dns.cpp
   src/tls.cpp
   src/url.cpp
   src/http.cpp

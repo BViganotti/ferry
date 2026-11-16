@@ -263,14 +263,15 @@ task<ConnectResult> connect_tcp(std::string_view host, uint16_t port, Deadline d
     co_return result;
   }
 
-  auto addresses = Address::resolve(host, port);
-  if (addresses.empty()) {
-    result.error = "cannot resolve host '" + std::string(host) + "'";
+  auto resolved = co_await resolve_async(std::string(host), port, deadline);
+  if (!resolved.ok()) {
+    result.error = resolved.error.empty() ? "cannot resolve host '" + std::string(host) + "'"
+                                          : resolved.error;
     co_return result;
   }
 
   std::string last_error = "connection failed";
-  for (const auto& address : addresses) {
+  for (const auto& address : resolved.addresses) {
     if (deadline.expired()) {
       result.error = "connection timed out";
       co_return result;

@@ -512,6 +512,32 @@ TEST(streaming_and_gzip) {
   server.stop();
 }
 
+TEST(async_dns) {
+  ferry::Server server(test_config());
+  server.get("/", [](const ferry::Request&) -> ferry::task<ferry::Response> {
+    co_return ferry::Response::text("dns");
+  });
+  server.start();
+
+  run_async([&]() -> ferry::task<void> {
+    auto resolved = co_await ferry::resolve_async(
+        "localhost", server.port(), ferry::Deadline::after(2000ms));
+    CHECK(resolved.ok());
+    CHECK(!resolved.addresses.empty());
+
+    ferry::Client client;
+    auto response = co_await client.get("http://localhost:" + std::to_string(server.port()) + "/");
+    CHECK_EQ(response.status, 200);
+    CHECK_EQ(response.body.view(), "dns");
+
+    auto expired = co_await ferry::resolve_async(
+        "localhost", server.port(), ferry::Deadline::after(0ms));
+    CHECK(!expired.ok());
+    CHECK(expired.error.find("timed out") != std::string::npos);
+  });
+  server.stop();
+}
+
 TEST(large_body) {
   auto config = test_config();
   config.max_body_bytes = 8 * 1024 * 1024;

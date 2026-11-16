@@ -65,6 +65,17 @@ struct ListenResult {
 // true, SO_REUSEPORT is required and an error is returned if unavailable.
 ListenResult listen_tcp(std::string_view host, uint16_t port, int backlog, bool reuse_port);
 
+struct ResolveResult {
+  std::vector<Address> addresses;
+  std::string error;
+
+  bool ok() const noexcept { return !addresses.empty(); }
+};
+
+// Resolves a host on a background resolver thread, then resumes the coroutine
+// on its event loop. Numeric addresses complete without touching the thread.
+task<ResolveResult> resolve_async(std::string host, uint16_t port, Deadline deadline);
+
 struct ConnectResult {
   Socket socket;
   std::string error;
