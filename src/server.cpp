@@ -175,52 +175,210 @@ bool etag_matches(std::string_view header, std::string_view etag) {
 
 enum class RangeResult { Ignore, Satisfiable, Unsatisfiable };
 
-RangeResult parse_range(std::string_view header, std::uint64_t size, std::uint64_t& start,
-                        std::uint64_t& end) {
+struct ByteRange {
+  std::uint64_t start = 0;
+  std::uint64_t end = 0;
+};
+
+bool parse_number(std::string_view text, std::uint64_t& value) {
+  if (text.empty()) return false;
+  std::uint64_t result = 0;
+  for (char c : text) {
+    if (c < '0' || c > '9') return false;
+    if (result > (UINT64_MAX - static_cast<std::uint64_t>(c - '0')) / 10) return false;
+    result = result * 10 + static_cast<std::uint64_t>(c - '0');
+  }
+  value = result;
+  return true;
+}
+
+struct RangeParse {
+  RangeResult status = RangeResult::Ignore;
+  std::vector<ByteRange> ranges;
+};
+
+RangeParse parse_ranges(std::string_view header, std::uint64_t size) {
+  RangeParse result;
   header = trim_ows(header);
-  if (!header.starts_with("bytes=")) return RangeResult::Ignore;
+  if (!header.starts_with("bytes=")) return result;
   header.remove_prefix(6);
-  if (header.find(',') != std::string_view::npos) return RangeResult::Ignore;
 
-  auto dash = header.find('-');
-  if (dash == std::string_view::npos) return RangeResult::Ignore;
+  bool syntactic = false;
+  bool unsatisfiable = false;
+  while (!header.empty()) {
+    auto comma = header.find(',');
+    auto spec = trim_ows(comma == std::string_view::npos ? header : header.substr(0, comma));
+    if (comma == std::string_view::npos) header = {};
+    else header.remove_prefix(comma + 1);
+    if (spec.empty()) continue;
+    auto dash = spec.find('-');
+    if (dash == std::string_view::npos) return result;
+    auto left = trim_ows(spec.substr(0, dash));
+    auto right = trim_ows(spec.substr(dash + 1));
+    syntactic = true;
 
-  auto parse_number = [](std::string_view text, std::uint64_t& value) {
-    if (text.empty()) return false;
-    std::uint64_t result = 0;
-    for (char c : text) {
-      if (c < '0' || c > '9') return false;
-      if (result > (UINT64_MAX - static_cast<std::uint64_t>(c - '0')) / 10) return false;
-      result = result * 10 + static_cast<std::uint64_t>(c - '0');
+    if (left.empty()) {
+      std::uint64_t suffix = 0;
+      if (!parse_number(right, suffix) || suffix == 0) return RangeParse{};
+      if (size == 0) {
+        unsatisfiable = true;
+        continue;
+      }
+      ByteRange range;
+      range.start = suffix >= size ? 0 : size - suffix;
+      range.end = size - 1;
+      result.ranges.push_back(range);
+    } else {
+      std::uint64_t first = 0;
+      if (!parse_number(left, first)) return RangeParse{};
+      if (first >= size) {
+        unsatisfiable = true;
+        continue;
+      }
+      ByteRange range;
+      range.start = first;
+      if (right.empty()) {
+        range.end = size - 1;
+      } else {
+        std::uint64_t last = 0;
+        if (!parse_number(right, last)) return RangeParse{};
+        if (last < first) {
+          unsatisfiable = true;
+          continue;
+        }
+        range.end = std::min(last, size - 1);
+      }
+      result.ranges.push_back(range);
     }
-    value = result;
-    return true;
+    if (result.ranges.size() > 32) return RangeParse{};
+  }
+
+  if (!result.ranges.empty()) {
+    result.status = RangeResult::Satisfiable;
+  } else if (syntactic && unsatisfiable) {
+    result.status = RangeResult::Unsatisfiable;
+  }
+  return result;
+}
+
+std::time_t parse_http_date_value(std::string_view text) {
+  std::string copy(text);
+  char weekday[32]{};
+  char month[8]{};
+  int day = 0;
+  int year = 0;
+  int hour = 0;
+  int minute = 0;
+  int second = 0;
+  if (std::sscanf(copy.c_str(), "%31[^,], %d %7s %d %d:%d:%d", weekday, &day, month, &year, &hour,
+                  &minute, &second) != 7) {
+    return 0;
+  }
+  static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+  int month_index = -1;
+  for (int i = 0; i < 12; ++i) {
+    if (std::strcmp(month, months[i]) == 0) {
+      month_index = i;
+      break;
+    }
+  }
+  if (month_index < 0) return 0;
+  std::tm tm{};
+  tm.tm_mday = day;
+  tm.tm_mon = month_index;
+  tm.tm_year = year - 1900;
+  tm.tm_hour = hour;
+  tm.tm_min = minute;
+  tm.tm_sec = second;
+  return ::timegm(&tm);
+}
+
+struct MultipartRangeState {
+  std::string path;
+  std::string content_type;
+  std::string boundary;
+  std::uint64_t total = 0;
+  std::vector<ByteRange> ranges;
+  std::size_t index = 0;
+  std::uint64_t offset = 0;
+  int fd = -1;
+  bool need_header = true;
+  bool finished = false;
+
+  ~MultipartRangeState() {
+    if (fd >= 0) ::close(fd);
+  }
+};
+
+Body::ChunkProducer make_multipart_range_producer(std::string path, std::string content_type,
+                                                  std::string boundary, std::uint64_t total,
+                                                  std::vector<ByteRange> ranges) {
+  auto state = std::make_shared<MultipartRangeState>();
+  state->path = std::move(path);
+  state->content_type = std::move(content_type);
+  state->boundary = std::move(boundary);
+  state->total = total;
+  state->ranges = std::move(ranges);
+
+  return [state](std::string& chunk) -> task<bool> {
+    if (state->finished) co_return false;
+
+    if (state->index >= state->ranges.size()) {
+      chunk = std::string(state->index == 0 ? "" : "\r\n") + "--" + state->boundary + "--\r\n";
+      state->finished = true;
+      co_return true;
+    }
+
+    auto& range = state->ranges[state->index];
+    if (state->need_header) {
+      std::string header;
+      if (state->index != 0) header += "\r\n";
+      header += "--" + state->boundary + "\r\n";
+      header += "content-type: " + state->content_type + "\r\n";
+      header += "content-range: bytes " + std::to_string(range.start) + "-" +
+                std::to_string(range.end) + "/" + std::to_string(state->total) + "\r\n\r\n";
+      chunk = std::move(header);
+      state->need_header = false;
+      state->offset = range.start;
+      if (state->fd < 0) {
+        state->fd = ::open(state->path.c_str(), O_RDONLY
+#if defined(O_CLOEXEC)
+                                                    | O_CLOEXEC
+#endif
+#if defined(O_NOFOLLOW)
+                                                    | O_NOFOLLOW
+#endif
+        );
+        if (state->fd < 0) {
+          state->finished = true;
+          co_return false;
+        }
+      }
+      co_return true;
+    }
+
+    if (state->offset <= range.end) {
+      std::size_t wanted = static_cast<std::size_t>(
+          std::min<std::uint64_t>(64 * 1024, range.end - state->offset + 1));
+      std::vector<char> buffer(wanted);
+      ssize_t n = 0;
+      do {
+        n = ::pread(state->fd, buffer.data(), wanted, static_cast<off_t>(state->offset));
+      } while (n < 0 && errno == EINTR);
+      if (n <= 0) {
+        state->finished = true;
+        co_return false;
+      }
+      chunk.assign(buffer.data(), static_cast<std::size_t>(n));
+      state->offset += static_cast<std::uint64_t>(n);
+      co_return true;
+    }
+
+    ++state->index;
+    state->need_header = true;
+    co_return true;
   };
-
-  auto left = trim_ows(header.substr(0, dash));
-  auto right = trim_ows(header.substr(dash + 1));
-  if (left.empty()) {
-    std::uint64_t suffix = 0;
-    if (!parse_number(right, suffix) || suffix == 0) return RangeResult::Ignore;
-    if (size == 0) return RangeResult::Unsatisfiable;
-    start = suffix >= size ? 0 : size - suffix;
-    end = size - 1;
-    return RangeResult::Satisfiable;
-  }
-
-  std::uint64_t first = 0;
-  if (!parse_number(left, first)) return RangeResult::Ignore;
-  if (first >= size) return RangeResult::Unsatisfiable;
-  start = first;
-  if (right.empty()) {
-    end = size - 1;
-  } else {
-    std::uint64_t last = 0;
-    if (!parse_number(right, last)) return RangeResult::Ignore;
-    if (last < first) return RangeResult::Unsatisfiable;
-    end = std::min(last, size - 1);
-  }
-  return RangeResult::Satisfiable;
 }
 
 }  // namespace
@@ -1056,29 +1214,49 @@ Server& Server::static_files(std::string_view prefix, std::string root, StaticOp
       return std::string();
     };
 
-    if (options_copy.etag) {
-      auto if_none_match = request.headers.get("if-none-match");
-      if (!if_none_match.empty() && etag_matches(if_none_match, etag)) {
-        Response response;
-        response.status = 304;
-        response.reason = "Not Modified";
-        response.headers.set("etag", etag);
-        response.headers.set("last-modified", last_modified);
-        if (!cache_control().empty()) response.headers.set("cache-control", cache_control());
-        co_return response;
+    bool not_modified = false;
+    auto if_none_match = request.headers.get("if-none-match");
+    if (options_copy.etag && !if_none_match.empty()) {
+      not_modified = etag_matches(if_none_match, etag);
+    } else {
+      auto if_modified_since = request.headers.get("if-modified-since");
+      if (!if_modified_since.empty()) {
+        auto since = parse_http_date_value(trim_ows(if_modified_since));
+        not_modified = since != 0 && info.st_mtime <= since;
       }
+    }
+    if (not_modified) {
+      Response response;
+      response.status = 304;
+      response.reason = "Not Modified";
+      if (options_copy.etag) response.headers.set("etag", etag);
+      response.headers.set("last-modified", last_modified);
+      if (!cache_control().empty()) response.headers.set("cache-control", cache_control());
+      co_return response;
     }
 
     std::uint64_t size = static_cast<std::uint64_t>(info.st_size);
-    std::uint64_t range_start = 0;
-    std::uint64_t range_end = size == 0 ? 0 : size - 1;
-    RangeResult range = RangeResult::Ignore;
+    std::string content_type = mime_type(candidate_string);
+    RangeParse range;
     if (request.method == Method::Get && size > 0) {
-      range = parse_range(request.headers.get("range"), size, range_start, range_end);
+      range = parse_ranges(request.headers.get("range"), size);
+      auto if_range = trim_ows(request.headers.get("if-range"));
+      if (!if_range.empty() && range.status != RangeResult::Ignore) {
+        bool apply = false;
+        if (if_range.starts_with("W/")) {
+          apply = false;
+        } else if (!if_range.empty() && if_range.front() == '"') {
+          apply = options_copy.etag && Headers::equals(if_range, etag);
+        } else {
+          auto date = parse_http_date_value(if_range);
+          apply = date != 0 && info.st_mtime <= date;
+        }
+        if (!apply) range = RangeParse{};
+      }
     }
 
     Response response;
-    if (range == RangeResult::Unsatisfiable) {
+    if (range.status == RangeResult::Unsatisfiable) {
       response.status = 416;
       response.reason = "Range Not Satisfiable";
       response.headers.set("content-range", "bytes */" + std::to_string(size));
@@ -1087,20 +1265,31 @@ Server& Server::static_files(std::string_view prefix, std::string root, StaticOp
       co_return response;
     }
 
-    if (range == RangeResult::Satisfiable) {
+    if (range.status == RangeResult::Satisfiable && range.ranges.size() == 1) {
+      auto [start, end] = range.ranges.front();
       response.status = 206;
       response.reason = "Partial Content";
-      response.body = Body::file_range(candidate_string, range_start, range_end - range_start + 1);
+      response.body = Body::file_range(candidate_string, start, end - start + 1);
       response.headers.set("content-range",
-                           "bytes " + std::to_string(range_start) + "-" +
-                               std::to_string(range_end) + "/" + std::to_string(size));
+                           "bytes " + std::to_string(start) + "-" + std::to_string(end) + "/" +
+                               std::to_string(size));
+      response.headers.set("content-type", content_type);
+    } else if (range.status == RangeResult::Satisfiable) {
+      static std::atomic<std::uint64_t> boundary_counter{0};
+      std::string boundary = "ferry" + std::to_string(info.st_mtime) + "-" +
+                             std::to_string(boundary_counter.fetch_add(1));
+      response.status = 206;
+      response.reason = "Partial Content";
+      response.body = Body::stream(make_multipart_range_producer(
+          candidate_string, content_type, boundary, size, range.ranges));
+      response.headers.set("content-type", "multipart/byteranges; boundary=" + boundary);
     } else {
       response.status = 200;
       response.reason = "OK";
       response.body = Body::file_range(candidate_string, 0, size);
+      response.headers.set("content-type", content_type);
     }
 
-    response.headers.set("content-type", mime_type(candidate_string));
     response.headers.set("accept-ranges", "bytes");
     response.headers.set("last-modified", last_modified);
     if (options_copy.etag) response.headers.set("etag", etag);

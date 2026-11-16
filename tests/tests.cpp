@@ -859,6 +859,37 @@ TEST(static_files) {
     auto unsatisfiable = co_await client.get(base + "/hello.txt", invalid_range);
     CHECK_EQ(unsatisfiable.status, 416);
 
+    auto last_modified = std::string(hello.header("last-modified"));
+    CHECK(!last_modified.empty());
+    ferry::Headers modified_since;
+    modified_since.set("if-modified-since", last_modified);
+    auto not_modified_since = co_await client.get(base + "/hello.txt", modified_since);
+    CHECK_EQ(not_modified_since.status, 304);
+
+    ferry::Headers wrong_if_range;
+    wrong_if_range.set("range", "bytes=0-4");
+    wrong_if_range.set("if-range", "\"wrong-etag\"");
+    auto full_response = co_await client.get(base + "/hello.txt", wrong_if_range);
+    CHECK_EQ(full_response.status, 200);
+    CHECK_EQ(std::string(full_response.body.view()), "hello world");
+
+    ferry::Headers right_if_range;
+    right_if_range.set("range", "bytes=0-4");
+    right_if_range.set("if-range", etag);
+    auto ranged_response = co_await client.get(base + "/hello.txt", right_if_range);
+    CHECK_EQ(ranged_response.status, 206);
+    CHECK_EQ(std::string(ranged_response.body.view()), "hello");
+
+    ferry::Headers multi_range;
+    multi_range.set("range", "bytes=0-4,6-10");
+    auto multi = co_await client.get(base + "/hello.txt", multi_range);
+    CHECK_EQ(multi.status, 206);
+    CHECK(multi.header("content-type").starts_with("multipart/byteranges"));
+    CHECK(contains(std::string(multi.body.view()), "hello"));
+    CHECK(contains(std::string(multi.body.view()), "world"));
+    CHECK(contains(std::string(multi.body.view()), "content-range: bytes 0-4/11"));
+    CHECK(contains(std::string(multi.body.view()), "content-range: bytes 6-10/11"));
+
     auto index = co_await client.get(base + "/");
     CHECK_EQ(index.status, 200);
     CHECK_EQ(std::string(index.body.view()), "<h1>index</h1>");
