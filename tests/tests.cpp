@@ -318,6 +318,18 @@ TEST(server_core) {
     co_return ferry::Response::text(std::string(request.form("a")) + "|" +
                                     std::string(request.form("b")));
   });
+  server.post("/multipart", [](const ferry::Request& request) -> ferry::task<ferry::Response> {
+    const auto& multipart = request.multipart();
+    const auto* title = request.part("title");
+    const auto* file = request.part("file");
+    if (!multipart.ok() || title == nullptr || file == nullptr) {
+      co_return ferry::Response::bad_request(multipart.error.empty() ? "missing parts"
+                                                                    : multipart.error);
+    }
+    co_return ferry::Response::text(std::to_string(multipart.parts.size()) + "|" + title->body +
+                                    "|" + file->filename + "|" + file->content_type + "|" +
+                                    file->body);
+  });
   server.get("/redirect", [](const ferry::Request&) -> ferry::task<ferry::Response> {
     co_return ferry::Response::redirect("/landed", 302);
   });
@@ -399,6 +411,17 @@ TEST(server_core) {
     CHECK_EQ(std::string(after_delete.body.view()), "|");
     client.clear_cookies();
     CHECK_EQ(client.cookies().size(), std::size_t{0});
+
+    const std::string boundary = "XyZ";
+    std::string multipart_body =
+        "--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n"
+        "--XyZ\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n"
+        "Content-Type: text/plain\r\n\r\nfile body\r\n--XyZ--\r\n";
+    auto multipart_response = co_await client.post(
+        base + "/multipart", multipart_body,
+        "multipart/form-data; boundary=" + boundary);
+    CHECK_EQ(multipart_response.status, 200);
+    CHECK_EQ(std::string(multipart_response.body.view()), "2|hello|a.txt|text/plain|file body");
 
     ferry::Headers custom;
     custom.set("x-test", "custom-value");

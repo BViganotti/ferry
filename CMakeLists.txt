@@ -27,6 +27,7 @@ set(FERRY_SOURCES
   src/router.cpp
   src/compression.cpp
   src/cookie_jar.cpp
+  src/multipart.cpp
   src/server.cpp
   src/client.cpp
 )

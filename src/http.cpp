@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "ferry/multipart.hpp"
 #include "ferry/url.hpp"
 
 namespace ferry {
@@ -430,6 +431,18 @@ bool Request::keep_alive() const noexcept {
     return !contains_token(connection, "close");
   }
   return contains_token(connection, "keep-alive");
+}
+
+const MultipartResult& Request::multipart() const {
+  if (!multipart_cache_) {
+    multipart_cache_ = std::make_shared<MultipartResult>(
+        parse_multipart(body, headers.get("content-type")));
+  }
+  return *multipart_cache_;
+}
+
+const MultipartPart* Request::part(std::string_view name) const {
+  return multipart().find(name);
 }
 
 bool Request::expects_continue() const noexcept {

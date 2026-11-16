@@ -8,6 +8,8 @@
 #include "ferry/tls.hpp"
 #include "ferry/url.hpp"
 #include "ferry/http.hpp"
+#include "ferry/multipart.hpp"
+#include "ferry/cookie_jar.hpp"
 #include "ferry/handler.hpp"
 #include "ferry/server.hpp"
 #include "ferry/client.hpp"

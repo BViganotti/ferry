@@ -15,6 +15,9 @@
 
 namespace ferry {
 
+struct MultipartPart;
+struct MultipartResult;
+
 enum class Method {
   Get,
   Head,
@@ -140,6 +143,10 @@ struct Request {
   std::string_view cookie(std::string_view name) const;
   std::string_view form(std::string_view name) const;
 
+  // multipart/form-data helpers (parsed lazily, cached per request).
+  const MultipartResult& multipart() const;
+  const MultipartPart* part(std::string_view name) const;
+
   bool keep_alive() const noexcept;
   bool expects_continue() const noexcept;
   std::string_view content_type() const noexcept { return headers.get("content-type"); }
@@ -152,6 +159,7 @@ struct Request {
   mutable std::vector<std::pair<std::string, std::string>> cookie_cache_;
   mutable bool form_parsed_ = false;
   mutable std::vector<std::pair<std::string, std::string>> form_cache_;
+  mutable std::shared_ptr<MultipartResult> multipart_cache_;
 
   void parse_query() const;
   void parse_cookies() const;
