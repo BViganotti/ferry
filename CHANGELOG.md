@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0 — 2026-11-16
+
+- Cookie jar, multipart parser, forward proxy/CONNECT, async DNS.
+- WebSocket server/client, trailers, conditional requests and multipart ranges.
+
 ## 0.1.0 — 2026-11-16
 
 First complete cut.
