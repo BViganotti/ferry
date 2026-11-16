@@ -13,3 +13,4 @@
 #include "ferry/handler.hpp"
 #include "ferry/server.hpp"
 #include "ferry/client.hpp"
+#include "ferry/websocket.hpp"

@@ -703,6 +703,15 @@ struct Server::Impl {
           }
         }
 
+        if (response.upgrade) {
+          try {
+            co_await response.upgrade(request, *connection->stream, connection->buffer);
+          } catch (const std::exception& e) {
+            log_warning(std::string("upgrade handler failed: ") + e.what());
+          }
+          break;
+        }
+
         if (!sent || !keep_alive) break;
       }
     } catch (const std::exception& e) {
@@ -1095,6 +1104,60 @@ Server& Server::options(std::string_view pattern, Handler handler) {
 Server& Server::any(std::string_view pattern, Handler handler) {
   impl_->require_configurable();
   impl_->router.add(Method::Get, std::string(pattern), std::move(handler), true);
+  return *this;
+}
+
+Server& Server::ws(std::string_view pattern, WsHandler handler) {
+  impl_->require_configurable();
+  auto route = [handler = std::move(handler)](const Request& request) -> task<Response> {
+    auto upgrade = trim_ows(request.header("upgrade"));
+    auto connection = request.header("connection");
+    auto key = request.header("sec-websocket-key");
+    auto version = request.header("sec-websocket-version");
+
+    bool connection_upgrade = false;
+    auto tokens = connection;
+    while (!tokens.empty()) {
+      auto comma = tokens.find(',');
+      auto token = trim_ows(comma == std::string_view::npos ? tokens : tokens.substr(0, comma));
+      if (Headers::equals(token, "upgrade")) connection_upgrade = true;
+      if (comma == std::string_view::npos) break;
+      tokens.remove_prefix(comma + 1);
+    }
+
+    if (!Headers::equals(upgrade, "websocket") || !connection_upgrade || key.empty() ||
+        version != "13") {
+      Response response(400, "invalid WebSocket handshake\n", "text/plain; charset=utf-8");
+      if (version != "13") {
+        response.status = 426;
+        response.reason = "Upgrade Required";
+        response.headers.set("sec-websocket-version", "13");
+      }
+      co_return response;
+    }
+
+    Response response;
+    response.status = 101;
+    response.reason = "Switching Protocols";
+    response.headers.set("upgrade", "websocket");
+    response.headers.set("connection", "Upgrade");
+    response.headers.set("sec-websocket-accept", websocket_accept_key(key));
+    auto protocols = request.header("sec-websocket-protocol");
+    if (!protocols.empty()) {
+      auto comma = protocols.find(',');
+      response.headers.set("sec-websocket-protocol",
+                           std::string(trim_ows(comma == std::string_view::npos
+                                                    ? protocols
+                                                    : protocols.substr(0, comma))));
+    }
+    response.upgrade = [handler](Request&, Stream& stream,
+                                 std::string& buffer) -> task<void> {
+      WebSocket websocket(stream, buffer, false);
+      co_await handler(websocket);
+    };
+    co_return response;
+  };
+  impl_->router.add(Method::Get, std::string(pattern), std::move(route));
   return *this;
 }
 

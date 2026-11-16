@@ -15,6 +15,7 @@
 #include "ferry/handler.hpp"
 #include "ferry/http.hpp"
 #include "ferry/tls.hpp"
+#include "ferry/websocket.hpp"
 
 namespace ferry {
 
@@ -68,6 +69,7 @@ class Server {
   Server& head(std::string_view pattern, Handler handler);
   Server& options(std::string_view pattern, Handler handler);
   Server& any(std::string_view pattern, Handler handler);
+  Server& ws(std::string_view pattern, WsHandler handler);
 
   Server& use(Middleware middleware);
   Server& static_files(std::string_view prefix, std::string root,

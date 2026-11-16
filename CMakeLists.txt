@@ -29,6 +29,7 @@ set(FERRY_SOURCES
   src/compression.cpp
   src/cookie_jar.cpp
   src/multipart.cpp
+  src/websocket.cpp
   src/server.cpp
   src/client.cpp
 )

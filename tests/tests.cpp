@@ -1132,6 +1132,51 @@ TEST(spawn_starts_jobs) {
   });
 }
 
+TEST(websocket_echo) {
+  ferry::Server server(test_config());
+  server.ws("/ws", [](ferry::WebSocket& socket) -> ferry::task<void> {
+    for (;;) {
+      auto frame = co_await socket.read();
+      if (!frame || frame->opcode == ferry::WsFrame::Opcode::Close) co_return;
+      if (frame->text()) {
+        co_await socket.send_text("echo:" + frame->payload);
+      } else if (frame->binary()) {
+        co_await socket.send_binary(std::span<const std::byte>(
+            reinterpret_cast<const std::byte*>(frame->payload.data()), frame->payload.size()));
+      }
+    }
+  });
+  server.start();
+
+  run_async([&]() -> ferry::task<void> {
+    auto socket = co_await ferry::websocket_connect(
+        "ws://127.0.0.1:" + std::to_string(server.port()) + "/ws");
+    CHECK(socket != nullptr);
+
+    co_await socket->send_text("hello");
+    auto frame = co_await socket->read();
+    CHECK(frame.has_value());
+    CHECK(frame->text());
+    CHECK_EQ(frame->payload, "echo:hello");
+
+    co_await socket->send_binary(std::span<const std::byte>(
+        reinterpret_cast<const std::byte*>("bytes"), 5));
+    auto binary = co_await socket->read();
+    CHECK(binary.has_value());
+    CHECK(binary->binary());
+    CHECK_EQ(binary->payload, "bytes");
+
+    co_await socket->ping("ping-data");
+    auto pong = co_await socket->read();
+    CHECK(pong.has_value());
+    CHECK(pong->opcode == ferry::WsFrame::Opcode::Pong);
+    CHECK_EQ(pong->payload, "ping-data");
+
+    co_await socket->close();
+  });
+  server.stop();
+}
+
 TEST(concurrency) {
   auto config = test_config(4);
   ferry::Server server(config);

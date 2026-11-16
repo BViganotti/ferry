@@ -17,6 +17,7 @@ namespace ferry {
 
 struct MultipartPart;
 struct MultipartResult;
+class Stream;
 
 enum class Method {
   Get,
@@ -174,6 +175,10 @@ struct Response {
   Body body;
   Headers trailers;
   bool close_connection = false;
+
+  // Set by protocol upgrades (currently WebSocket). The server writes the
+  // response head, then hands the raw stream and unread buffer to this task.
+  std::function<task<void>(Request&, Stream&, std::string&)> upgrade;
 
   // Client transport failures set status = 0 and fill this.
   std::string error;
