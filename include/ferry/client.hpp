@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "ferry/cookie_jar.hpp"
 #include "ferry/http.hpp"
 #include "ferry/url.hpp"
 
@@ -30,6 +31,7 @@ struct ClientConfig {
 
   bool accept_gzip = true;
   bool reuse_connections = true;
+  bool use_cookies = true;
   std::size_t max_idle_per_host = 8;
 
   std::string user_agent = "ferry/0.1.0";
@@ -63,6 +65,10 @@ class Client {
 
   // Closes all idle pooled connections.
   void close();
+
+  // Cookie jar used for automatic Cookie / Set-Cookie handling.
+  CookieJar& cookies();
+  void clear_cookies();
 
   const ClientConfig& config() const noexcept;
 

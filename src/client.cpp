@@ -93,6 +93,7 @@ struct Client::Impl {
   };
 
   ClientConfig config;
+  CookieJar jar;
   EventLoop* loop = nullptr;
   std::shared_ptr<TlsContext> verified_tls;
   std::shared_ptr<TlsContext> insecure_tls;
@@ -192,6 +193,18 @@ struct Client::Impl {
       headers.set("accept-encoding", "gzip");
     }
     headers.set("connection", keep_alive ? "keep-alive" : "close");
+
+    if (config.use_cookies) {
+      auto cookie = jar.header_for(pending.url);
+      if (!cookie.empty()) {
+        auto existing = headers.get("cookie");
+        if (existing.empty()) {
+          headers.set("cookie", std::move(cookie));
+        } else {
+          headers.set("cookie", std::string(existing) + "; " + cookie);
+        }
+      }
+    }
 
     if (!pending.url.userinfo.empty() && !headers.has("authorization")) {
       headers.set("authorization",
@@ -473,6 +486,12 @@ struct Client::Impl {
         co_return failure;
       }
 
+      if (config.use_cookies) {
+        for (auto set_cookie : response.headers.get_all("set-cookie")) {
+          jar.store(pending.url, set_cookie);
+        }
+      }
+
       bool keep = config.reuse_connections && !close_after && !response.close_connection;
       if (keep) {
         release(std::move(acquired.stream), pending.url);
@@ -591,6 +610,10 @@ task<Response> Client::send(Method method, std::string_view url, Body body, Head
 void Client::close() {
   if (impl_) impl_->pool.clear();
 }
+
+CookieJar& Client::cookies() { return impl_->jar; }
+
+void Client::clear_cookies() { impl_->jar.clear(); }
 
 const ClientConfig& Client::config() const noexcept { return impl_->config; }
 

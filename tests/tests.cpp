@@ -284,6 +284,33 @@ TEST(server_core) {
     response.set_cookie("theme", "dark");
     co_return response;
   });
+  server.get("/jar/set", [](const ferry::Request&) -> ferry::task<ferry::Response> {
+    ferry::Response response = ferry::Response::text("set");
+    ferry::CookieOptions scoped;
+    scoped.path = "/jar";
+    response.set_cookie("session", "jar-value", scoped);
+    ferry::CookieOptions secure;
+    secure.secure = true;
+    response.set_cookie("secure-cookie", "secret", secure);
+    co_return response;
+  });
+  server.get("/jar/check", [](const ferry::Request& request) -> ferry::task<ferry::Response> {
+    co_return ferry::Response::text(std::string(request.cookie("session")) + "|" +
+                                    std::string(request.cookie("secure-cookie")));
+  });
+  server.get("/other/jar-check",
+             [](const ferry::Request& request) -> ferry::task<ferry::Response> {
+               co_return ferry::Response::text(std::string(request.cookie("session")));
+             });
+  server.get("/jar/delete", [](const ferry::Request&) -> ferry::task<ferry::Response> {
+    ferry::Response response = ferry::Response::text("deleted");
+    ferry::CookieOptions expired;
+    expired.path = "/jar";
+    expired.has_max_age = true;
+    expired.max_age_seconds = 0;
+    response.set_cookie("session", "", expired);
+    co_return response;
+  });
   server.get("/read-cookie", [](const ferry::Request& request) -> ferry::task<ferry::Response> {
     co_return ferry::Response::text(std::string(request.cookie("session")));
   });
@@ -358,6 +385,20 @@ TEST(server_core) {
     auto form = co_await client.post(base + "/form", "a=1&b=hello+world",
                                      "application/x-www-form-urlencoded");
     CHECK_EQ(std::string(form.body.view()), "1|hello world");
+
+    client.clear_cookies();
+    auto jar_set = co_await client.get(base + "/jar/set");
+    CHECK_EQ(jar_set.status, 200);
+    auto jar_check = co_await client.get(base + "/jar/check");
+    CHECK_EQ(std::string(jar_check.body.view()), "jar-value|");
+    auto other_path = co_await client.get(base + "/other/jar-check");
+    CHECK_EQ(other_path.body.view(), "");
+    auto deleted = co_await client.get(base + "/jar/delete");
+    CHECK_EQ(deleted.status, 200);
+    auto after_delete = co_await client.get(base + "/jar/check");
+    CHECK_EQ(std::string(after_delete.body.view()), "|");
+    client.clear_cookies();
+    CHECK_EQ(client.cookies().size(), std::size_t{0});
 
     ferry::Headers custom;
     custom.set("x-test", "custom-value");
